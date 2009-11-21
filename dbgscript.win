@@ -1,0 +1,7 @@
+.echo "Script loaded. Have fun..."
+lm sm
+.reload /f /v aio_server.exe
+!chksym aio_server.exe!
+bp aio_server!server_start_and_run
+bp aio_server!server_cleanup_and_shutdown
+g

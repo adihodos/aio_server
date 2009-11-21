@@ -1,0 +1,107 @@
+!IF "$(CFG)" == ""
+CFG = Debug x86
+!MESSAGE No configuration specified. Defaulting to debug x86.
+!ENDIF
+
+!IF "$(CFG)" != "Debug x86" && "$(CFG)" != "Release x86"
+!MESSAGE Invalid configuration specified!
+!MESSAGE Possible configurations are:
+!MESSAGE    debug x86
+!MESSAGE    release x86
+!ERROR   INVALID CONFIGURATION SPECIFIED!!
+!ENDIF
+
+!IF "$(CFG)" == "Debug x86"
+
+CC      = cl.exe
+CFLAGS  = /nologo /Zi /Od /W4 /WX /MDd /RTC1 /D__OS_WINDOWS__                 \
+          /D__DEBUG_ENABLED__ /D_DEBUG /DDEBUG /c /wd4127 										\
+					/D_WIN32_WINNT=0x0600 /D_WIN32_WINDOWS=0x0600 /DWINVER=0x600
+LINK32  = link.exe
+LFLAGS  = /nologo /debug /subsystem:console /machine:x86
+LIBS    = dbghelp.lib ws2_32.lib mswsock.lib user32.lib
+OUTDIR  = build_files
+
+OBJECTS =                                                                     \
+  "$(OUTDIR)\debug_helpers_win.obj"                                           \
+  "$(OUTDIR)\server_main.obj"                                                      \
+  "$(OUTDIR)\allocator.obj"                                                   \
+  "$(OUTDIR)\linked_list.obj"                                                 \
+	"$(OUTDIR)\misc.obj"																												\
+	"$(OUTDIR)\http_codes.obj"																									\
+  "$(OUTDIR)\server_impl_windows.obj"																					
+
+TARGET  = "$(OUTDIR)\aio_server.exe" 
+
+{}.c{$(OUTDIR)\}.obj::
+  $(CC) $(CFLAGS) $< /I ../base /Fo"$(OUTDIR)\\" /Fd"$(OUTDIR)\\"
+
+{base\}.c{$(OUTDIR)\}.obj::
+  $(CC) $(CFLAGS) $< /Fo"$(OUTDIR)\\" /Fd"$(OUTDIR)\\"
+
+$(TARGET) : $(OUTDIR) $(OBJECTS)
+  $(LINK32) $(LFLAGS) $(OBJECTS) $(LIBS) /out:$@
+
+$(OUTDIR) :
+  if not exist "$(OUTDIR)" mkdir "$(OUTDIR)"
+
+$(OUTDIR)\server_main.obj :                                                   \
+  server.h                                                             				\
+  server_impl_windows.c                                                				\
+  server_main.c                                                               \
+  {base\}debug_helpers.h                                                      \
+  {base\}debug_helpers_win.c                                                  \
+  {base\}basetypes.h																													
+
+$(OUTDIR)\debug_helpers_win.obj :                                             \
+  {base\}debug_helpers_win.c                                                  \
+  {base\}debug_helpers.h                                                      \
+  {base\}basetypes.h
+
+$(OUTDIR)\allocator.obj :                                                     \
+  {base\}allocator.c                                                          \
+  {base\}basetypes.h                                                          \
+  {base\}allocator.h                                                          \
+  {base\}atomic.h                                                             \
+  {base\}atomic_msvc.h
+
+$(OUTDIR)\linked_list.obj :                                                   \
+  {base\}linked_list.c                                                        \
+  {base\}linked_list.h                                                        \
+  {base\}allocator.h                                                          \
+  {base\}allocator.c                                                          \
+  {base\}debug_helpers.h                                                      \
+  {base\}debug_helpers_win.c                                                  
+
+$(OUTDIR)\server_impl_windows.obj :                                           \
+  {base\}server.h                                                             \
+  {base\}server_impl_windows.c                                                \
+  {base\}basetypes.h                                                          \
+  {base\}debug_helpers.h                                                      \
+  {base\}debug_helpers_win.c                                                  \
+  {base\}allocator.h                                                          \
+  {base\}allocator.c                                                          \
+  {base\}linked_list.h                                                        \
+  {base\}linked_list.c                                                        \
+  {base\}atomic.h                                                             \
+  {base\}atomic_msvc.h                                                        \
+  {base\}lock.h                                                               \
+	{base\}misc.h																																\
+	{base\}misc.c																																\
+	{base\}http_codes.h																													\
+	{base\}http_codes.c
+
+$(OUTDIR)\misc.obj :																													\
+	{base\}misc.c																																\
+	{base\}misc.h
+
+$(OUTDIR)\http_codes.obj :																										\
+	{base\}http_codes.c																													\
+	{base\}http_codes.h																													\
+	{base\}basetypes.h
+
+clean :
+  -@del /F /Q $(OUTDIR)\*.*
+
+
+!ENDIF
