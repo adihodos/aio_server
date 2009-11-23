@@ -1,6 +1,9 @@
 #ifndef _STATISTICS_H
 #define _STATISTICS_H
 
+#include "lock.h"
+#include "atomic.h"
+
 #if defined(__ENABLE_STATISTICS__)
 #pragma message("Compiling with statistics enabled!")
 
@@ -32,6 +35,7 @@ typedef enum {
 } kStatsType;
 
 void server_update_stats(struct server_stats* ss, kStatsType stat_type, ...);
+void server_dump_stats(struct server_stats* ss);
 
 #define STATS_INITIALIZE(stats)                                                \
   do {                                                                         \
@@ -53,6 +57,13 @@ void server_update_stats(struct server_stats* ss, kStatsType stat_type, ...);
 #define STATS_UPDATE_TRANSFER_COUNT(stats, amount)                             \
   server_update_stats(stats, kStatsTransferSuccess, amount)
 
+#define STATS_DUMP(stats)                                                      \
+  do {                                                                         \
+    lock_acquire(&stats->ss_stats_lock);                                       \
+    server_dump_stats(stats);                                                  \
+    lock_release(&stats->ss_stats_lock);                                       \
+  } while(0)
+
 #else
 
 #pragma message("Compiling with statistics disabled!")
@@ -62,6 +73,7 @@ void server_update_stats(struct server_stats* ss, kStatsType stat_type, ...);
 #define STATS_INCREMENT_CONNECTION_COUNT(stats)             (void)(0)
 #define STATS_DECREMENT_CONNECTION_COUNT(stats)             (void)(0)
 #define STATS_UPDATE_TRANSFER_COUNT(stats, amount)          (void)(0)
+#define STATS_DUMP(stats)                                   (void)(0)
 
 #endif
 

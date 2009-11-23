@@ -793,6 +793,7 @@ static void server_cleanup_and_shutdown(struct server_data* sv) {
   CloseHandle(sv->sv_iocp);
 
   lock_destroy(&sv->sv_list_lock);
+  STATS_DUMP((&sv->sv_stats));
   STATS_UNINITIALIZE((&sv->sv_stats));
   SetConsoleCtrlHandler(server_control_handler, FALSE);
   WSACleanup();
