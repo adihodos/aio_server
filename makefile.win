@@ -11,11 +11,17 @@ CFG = Debug x86
 !ERROR   INVALID CONFIGURATION SPECIFIED!!
 !ENDIF
 
+!IF "$(STATISTICS)" == "ENABLED"
+STAT_FLAGS = /D__ENABLE_STATISTICS__
+!ELSE
+STAT_FLAGS =
+!ENDIF
+
 !IF "$(CFG)" == "Debug x86"
 
 CC      = cl.exe
 CFLAGS  = /nologo /Zi /Od /W4 /WX /MDd /RTC1 /D__OS_WINDOWS__                 \
-          /D__DEBUG_ENABLED__ /D_DEBUG /DDEBUG /c /wd4127 										\
+          /D__DEBUG_ENABLED__ /D_DEBUG /DDEBUG /c /wd4127											\
 					/D_WIN32_WINNT=0x0600 /D_WIN32_WINDOWS=0x0600 /DWINVER=0x600
 LINK32  = link.exe
 LFLAGS  = /nologo /debug /subsystem:console /machine:x86
@@ -24,20 +30,21 @@ OUTDIR  = build_files
 
 OBJECTS =                                                                     \
   "$(OUTDIR)\debug_helpers_win.obj"                                           \
-  "$(OUTDIR)\server_main.obj"                                                      \
+  "$(OUTDIR)\server_main.obj"                                                 \
   "$(OUTDIR)\allocator.obj"                                                   \
   "$(OUTDIR)\linked_list.obj"                                                 \
 	"$(OUTDIR)\misc.obj"																												\
 	"$(OUTDIR)\http_codes.obj"																									\
+	"$(OUTDIR)\statistics.obj"																									\
   "$(OUTDIR)\server_impl_windows.obj"																					
 
-TARGET  = "$(OUTDIR)\aio_server.exe" 
+TARGET = "$(OUTDIR)\aio_server.exe" 
 
 {}.c{$(OUTDIR)\}.obj::
-  $(CC) $(CFLAGS) $< /I ../base /Fo"$(OUTDIR)\\" /Fd"$(OUTDIR)\\"
+  $(CC) $(CFLAGS) $(STAT_FLAGS) $< /I ../base /Fo"$(OUTDIR)\\" /Fd"$(OUTDIR)\\"
 
 {base\}.c{$(OUTDIR)\}.obj::
-  $(CC) $(CFLAGS) $< /Fo"$(OUTDIR)\\" /Fd"$(OUTDIR)\\"
+  $(CC) $(CFLAGS) $(STAT_FLAGS) $< /Fo"$(OUTDIR)\\" /Fd"$(OUTDIR)\\"
 
 $(TARGET) : $(OUTDIR) $(OBJECTS)
   $(LINK32) $(LFLAGS) $(OBJECTS) $(LIBS) /out:$@
@@ -46,8 +53,8 @@ $(OUTDIR) :
   if not exist "$(OUTDIR)" mkdir "$(OUTDIR)"
 
 $(OUTDIR)\server_main.obj :                                                   \
-  server.h                                                             				\
-  server_impl_windows.c                                                				\
+  server.h																																		\
+  server_impl_windows.c																												\
   server_main.c                                                               \
   {base\}debug_helpers.h                                                      \
   {base\}debug_helpers_win.c                                                  \
@@ -89,7 +96,9 @@ $(OUTDIR)\server_impl_windows.obj :                                           \
 	{base\}misc.h																																\
 	{base\}misc.c																																\
 	{base\}http_codes.h																													\
-	{base\}http_codes.c
+	{base\}http_codes.c																													\
+	{base\}statistics.h																													\
+	{base\}statistics.c
 
 $(OUTDIR)\misc.obj :																													\
 	{base\}misc.c																																\
@@ -100,8 +109,14 @@ $(OUTDIR)\http_codes.obj :																										\
 	{base\}http_codes.h																													\
 	{base\}basetypes.h
 
+$(OUTDIR)\statistics.obj :																										\
+	{base\}statistics.h																												  \
+	{base\}statistics.c																												  \
+	{base\}lock.h																															  \
+	{base\}atomic.h																														  \
+	{base\}atomic_msvc.h	
+
 clean :
   -@del /F /Q $(OUTDIR)\*.*
-
 
 !ENDIF

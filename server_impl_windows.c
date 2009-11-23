@@ -28,6 +28,7 @@
 #include "base/lock.h"
 #include "base/misc.h"
 #include "base/http_codes.h"
+#include "base/statistics.h"
 #include "server.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -97,71 +98,6 @@ typedef enum {
   kIocpMsgShutDown = 0x00
 } kIocpMessage;
 
-#if defined(__ENABLE_STATISTICS__)
-
-struct server_stats {
-  atomic32_t  ss_total_connections;
-  atomic32_t  ss_concurrent_connections;
-  atomic32_t  ss_peak_connections;
-  atomic32_t  ss_total_bytes;
-  os_lock_t   ss_stats_lock;
-};
-
-
-typedef enum {
-  /*!
-   * Connection accepted. No argument.
-   */
-  kStatsAddConnection = 0x00,
-  /*!
-   * Connection closed. No argument.
-   */
-  kStatsDelConnection = 0x01,
-  /*!
-   * Successfull transfer to client. Expects an unsigned long representing
-   * the number of bytes transferred.
-   */
-  kStatsTransferSuccess = 0x02,
-} kStatsType;
-
-static void server_update_stats(struct server_stats* ss, 
-                                kStatsType stat_type, 
-                                ...);
-
-#define STATS_INITIALIZE(stats) \
-  do {\
-    memset(stats, 0, sizeof(*stats));  \
-    lock_init(&stats->ss_stats_lock); \
-  } while(0)
-
-#define STATS_UNINITIALIZE(stats) \
-  do {\
-    lock_destroy(&stats->ss_stats_lock);  \
-  } while(0)
-
-#define STATS_INCREMENT_CONNECTION_COUNT(stats) \
-  server_update_stats(stats, kStatsAddConnection)
-
-#define STATS_DECREMENT_CONNECTION_COUNT(stats) \
-  server_update_stats(stats, kStatsDelConnection)
-
-#define STATS_UPDATE_TRANSFER_COUNT(stats, amount)  \
-  server_update_stats(stats, kStatsTransferSuccess, amount)
-
-#else /* __ENABLE_STATISTICS__ */
-
-#define STATS_INITIALIZE(stats) (void)(0)
-
-#define STATS_UNINITIALIZE(stats) (void)(0)
-
-#define STATS_INCREMENT_CONNECTION_COUNT(stats) (void)(0)
-
-#define STATS_DECREMENT_CONNECTION_COUNT(stats) (void)(0)
-
-#define STATS_UPDATE_TRANSFER_COUNT(stats, amount)  (void)(0)
-
-#endif /* !__ENABLE_STATISTICS__ */
-
 /*!
  * @brief Abstract representation of our server.
  */
@@ -213,12 +149,7 @@ struct server_data {
    * Lock to serialize access to the client list.
    */
   os_lock_t                 sv_list_lock;
-#if defined(__ENABLE_STATISTICS__)
-  /*!
-   * Simple structure to keep statistical data.
-   */
-  struct server_stats       sv_stats;
-#endif
+  SERVER_STATISTICS_STRUCT_MEMBER_ENTRY(sv_stats)
 };
 
 /*!
@@ -451,7 +382,7 @@ BOOL server_init(struct server_data* sv) {
 
   sv->sv_allocator = allocator_handle;
   lock_init(&sv->sv_list_lock);
-  STATS_INITIALIZE(&sv->sv_stats);
+  STATS_INITIALIZE((&sv->sv_stats));
   ++rollback; /* level 2 */
   
   sv->sv_clients = dlist_create(client_compare_fn, allocator_handle, sv);
@@ -570,7 +501,7 @@ ERR_CLEANUP :
 
   case 2 :
     lock_destroy(&sv->sv_list_lock);
-    STATS_UNINITIALIZE(&sv->sv_stats);
+    STATS_UNINITIALIZE((&sv->sv_stats));
 
   case 1 :
     WSACleanup();
@@ -862,7 +793,7 @@ static void server_cleanup_and_shutdown(struct server_data* sv) {
   CloseHandle(sv->sv_iocp);
 
   lock_destroy(&sv->sv_list_lock);
-  STATS_UNINITIALIZE(&sv->sv_stats);
+  STATS_UNINITIALIZE((&sv->sv_stats));
   SetConsoleCtrlHandler(server_control_handler, FALSE);
   WSACleanup();
 }
@@ -1268,41 +1199,3 @@ static void server_work_loop_ex(struct server_data* sv) {
     }
   }
 }
-
-#if defined(__ENABLE_STATISTICS__)
-static void server_update_stats(struct server_stats* ss, 
-                                kStatsType stat_type, 
-                                ...) {
-  va_list args_ptr;
-  DWORD bytes_transferred;
-
-  va_start(args_ptr, stat_type);
-  lock_acquire(&ss->ss_stats_lock);
-
-  switch (stat_type) {
-  case kStatsAddConnection :
-    ++ss->ss_total_connections;
-    ++ss->ss_concurrent_connections;
-    if (ss->ss_peak_connections < ss->ss_concurrent_connections) {
-      ss->ss_peak_connections = ss->ss_concurrent_connections;
-    }
-    break;
-
-  case kStatsDelConnection :
-    --ss->ss_concurrent_connections;
-    --ss->ss_total_connections;
-    break;
-
-  case kStatsTransferSuccess :
-    bytes_transferred = va_arg(args_ptr, DWORD);
-    ss->ss_total_bytes += bytes_transferred;
-    break;
-
-  default :
-    break;
-  }
-
-  lock_release(&ss->ss_stats_lock);
-  va_end(args_ptr);
-}
-#endif /* __ENABLE_STATISTICS__ */
