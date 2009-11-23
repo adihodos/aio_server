@@ -61,4 +61,5 @@ void server_dump_stats(struct server_stats* ss) {
 #error Unknown architecture!!
 #endif
 }
+
 #endif /* __ENABLE_STATISTICS__ */
