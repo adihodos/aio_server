@@ -1,0 +1,11 @@
+*.swp
+*.bak
+*.obj
+*~
+*.pdb
+*.ilk
+*.exe
+*.pch
+*.tmp
+*tags*
+*#
