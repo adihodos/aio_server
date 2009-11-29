@@ -70,7 +70,7 @@ static int default_stats_dumper(struct allocator* al, void* stream) {
 #endif
 
   BUGSTOP_IF((!stream), "Invalid parameter, expected a file HANDLE.");
-  BUGSTOP_IF((!al), "Invalid paramater, expected a valid struct "
+  BUGSTOP_IF((!al), "Invalid parameter, expected a valid struct "
              "allocator pointer.");
 
   total_commits = atomic32_load(
@@ -84,7 +84,9 @@ static int default_stats_dumper(struct allocator* al, void* stream) {
                                NULL,
                                NULL,
                                STRSAFE_IGNORE_NULLS,
-                               "\nTotal operations %d\nAllocations %d\nReleases%d\n",
+                               "\nTotal operations: %d\n"
+                               "Allocations: %d\n"
+                               "Releases: %d\n",
                                total_commits + total_releases,
                                total_commits,
                                total_releases))) {

@@ -607,6 +607,7 @@ ERR_CLEANUP :
 static void server_cleanup_client_data(struct server_data* sv, 
                                        struct client* cl,
                                        kClientCloseOpt close_opt) {
+  UNUSED_PRE(close_opt);
   if (INVALID_SOCKET != cl->cl_sock) {
     if (close_opt & kClientCloseAbortative) {
       struct linger abort;
@@ -1097,8 +1098,7 @@ static void client_destructor(void* client_data, void* server_data, void* args) 
   UNUSED_PRE(args);
   server_cleanup_client_data(server_data, 
                              client_data,
-                             kClientCloseAbortative | 
-                             kClientCloseRemoveFromList);
+                             kClientCloseAbortative); 
 }
 
 static void server_handle_client_write_completion(struct server_data* sv,
