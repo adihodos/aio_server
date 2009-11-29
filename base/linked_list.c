@@ -252,3 +252,7 @@ void dlist_destroy(dlinked_list_handle list_handle) {
 
   list->dl_allocator->al_mem_release(list->dl_allocator, list);
 }
+
+size_t dlist_size(dlinked_list_handle list_handle) {
+  return ((struct dlinked_list*) list_handle)->dl_items;
+}

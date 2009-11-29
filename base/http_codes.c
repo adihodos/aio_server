@@ -6,7 +6,7 @@
 
 struct http_response kHTTPResponseArray[] = {
   { 
-    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-length %I64u\r\n",
+    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-length: %I64u\r\n",
     200,
     (size_t) -1 /* not valid for this one, call strlen on the resulting string */
   },

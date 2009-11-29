@@ -1,10 +1,11 @@
 $$ .for (r? $t0 = @@c++(((aio_server!list_node*) 0x03c20014)->n_link[1])
-r @$t2 = 0;
+.echo tra la la ${$arg1}
+r @$t2 = 0
 .for (r? $t0 = @@c++(((aio_server!list_node*) ${$arg1})->n_link[1])
-      (@$t0 != ${$arg1}); 
+      (@$t0 != ${$arg1})
       r? $t0 = @@c++(((aio_server!list_node*) @$t0)->n_link[1])) {
-  r $t2 = @$t2 + 1;
-  r? $t1 = @@c++((aio_server!client*) @$t0->n_data);
+  r $t2 = @$t2 + 1
+  r? $t1 = @@c++((aio_server!client*) @$t0->n_data)
   .printf "\nNode @%p, client @%p, client count %d\n", @$t0, @$t1, @$t2
   dt aio_server!list_node @$t0
   dt aio_server!client @$t1
