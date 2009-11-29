@@ -104,4 +104,6 @@ void dlist_for_each(dlinked_list_handle list_handle,
  */
 void  dlist_destroy(dlinked_list_handle list_handle);
 
+size_t dlist_size(dlinked_list_handle list_handle);
+
 #endif /* _LINKED_LIST_H */
