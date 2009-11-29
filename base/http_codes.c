@@ -4,9 +4,14 @@
 #include "basetypes.h"
 #include "http_codes.h"
 
+const char* const kHTTPContentTypeTextHtml = "text/html; charset=UTF-8";
+
 struct http_response kHTTPResponseArray[] = {
   { 
-    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-length: %I64u\r\n",
+    "HTTP/1.1 200 OK\r\n"
+    "Content-length: %I64u\r\n"
+    "Connection: close\r\n"
+    "Content-Type: %s\r\n\r\n",
     200,
     (size_t) -1 /* not valid for this one, call strlen on the resulting string */
   },

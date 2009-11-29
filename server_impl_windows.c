@@ -42,7 +42,7 @@
 #define kMaxCompletionCount 16
 
 /*!
- * Since we annot pass any user defined arguments to SetConsoleCtrlHandler() we
+ * Since we cannot pass any user defined arguments to SetConsoleCtrlHandler() we
  * need to use this global handle to signal CTRL-C/LOGON/LOGOFF events.
  */
 static HANDLE iocp_handle;
@@ -64,8 +64,10 @@ static const int kSVDefaultThreadToProcessorRatio = 1;
 
 /*!
  * Number of maximum connected clients. -1 Means no limit.
+ * Not implemented.
  */
 static const int kSVDefaultUnlimitedConnections = -1;
+
 /*!
  * Default server port.
  */
@@ -99,13 +101,11 @@ typedef enum {
 } kIocpMessage;
 
 /*!
- * @brief Abstract representation of our server.
+ * @brief Abstract representation of the server.
  */
 struct server_data {
   /*!
-   * Context for overlapped operations. Normally the server data structure
-   * should not be used in overlapped operations except when loading function
-   * pointers from Winsock.
+   * Context for overlapped operations. 
    */
   struct aio_data           io_context;
   /*!
@@ -118,7 +118,7 @@ struct server_data {
   HANDLE                    sv_iocp;
   /*!
    * Array of worker threads. The decision to create one thread/processor is
-   * only a heuristic, feel free to modify it.
+   * only a heuristic. 
    */
   HANDLE*                   sv_worker_threads;
   /*!
@@ -177,6 +177,7 @@ struct client {
    * Buffers to use when calling TransmitFile().
    */
   TRANSMIT_FILE_BUFFERS cl_ts_buffers;
+  size_t                cl_is_tracked;
 };
 
 static const size_t kClientObjectSize = sizeof(struct client);
@@ -218,6 +219,12 @@ static void server_cleanup_client_data(struct server_data* sv,
                                        struct client* cl,
                                        kClientCloseOpt close_opt);
 
+/*
+ * Entry point function for worker threads. We must use _beginthreadex() 
+ * because we need CRT functions like strtok_s() and others.
+ */
+static unsigned int __stdcall server_worker_thread(void* args);
+
 static SOCKET create_server_socket(void) {
   struct addrinfo   hints;
   struct addrinfo*  svdata        =   NULL ;
@@ -243,19 +250,19 @@ static SOCKET create_server_socket(void) {
                       WSA_FLAG_OVERLAPPED);
 
   if (INVALID_SOCKET == sv_sock) {
-    D_FUNCFAIL_WSAAPI(WSASocket());
+    D_FUNCFAIL_WSAAPI(WSASocket);
     goto ERR_CLEANUP;
   }
 
   result = bind(sv_sock, svdata->ai_addr, (int) svdata->ai_addrlen);
   if (SOCKET_ERROR == result) {
-    D_FUNCFAIL_WSAAPI(bind());
+    D_FUNCFAIL_WSAAPI(bind);
     goto ERR_CLEANUP;
   }
 
   result = listen(sv_sock, SOMAXCONN);
   if (SOCKET_ERROR == result) {
-    D_FUNCFAIL_WSAAPI(WSASocket());
+    D_FUNCFAIL_WSAAPI(WSASocket);
     goto ERR_CLEANUP;
   }
 
@@ -312,12 +319,6 @@ static BOOL WINAPI server_control_handler(DWORD ctrl_type) {
   return TRUE;
 }
 
-/*
- * Entry point function for worker threads. We must use _beginthreadex() 
- * because we need CRT functions like strtok_s() and others.
- */
-static unsigned int __stdcall server_worker_thread(void* args);
-
 static BOOL load_function_pointer_from_wsa(SOCKET sock,
                                            GUID guid_fnptr,
                                            void* outbuff,
@@ -345,7 +346,7 @@ static BOOL load_function_pointer_from_wsa(SOCKET sock,
     return FALSE;
   }
 
-  for(; ;) {
+  for(;;) {
     DWORD bytes_out;
     DWORD flags_out;
 
@@ -470,10 +471,6 @@ BOOL server_init(struct server_data* sv) {
                 sizeof(HANDLE) * sv->sv_worker_count);
 
   for (i = 0; i < (int) sv->sv_worker_count; ++i) {
-    /*
-     * Changed CreateThread() to _beginthreadex() because we need to
-     * use some CRT functions (strtok_s, _stricmp).
-     */
     sv->sv_worker_threads[i] = (HANDLE) _beginthreadex(NULL,
                                                        0,
                                                        server_worker_thread,
@@ -524,18 +521,18 @@ ERR_CLEANUP :
 static void server_add_client_to_list(struct server_data* sv,
                                       struct client* cl) {
   lock_acquire(&sv->sv_list_lock);
-  BUGSTOP_IF((NULL != dlist_find(sv->sv_clients, cl)), 
-             "Client already in list!");
+  BUGSTOP_IF((cl->cl_is_tracked), "Client is already in list!");
   dlist_push_head(sv->sv_clients, cl);
+  cl->cl_is_tracked = 1;
   lock_release(&sv->sv_list_lock);
 }
 
 static void server_remove_client_from_list(struct server_data* sv,
                                            struct client* cl) {
   lock_acquire(&sv->sv_list_lock);
-  BUGSTOP_IF((!dlist_find(sv->sv_clients, cl)), 
-             "Removed called on client not in list!");
+  BUGSTOP_IF((!cl->cl_is_tracked), "Client is not in list!");
   dlist_remove_item(sv->sv_clients, cl);
+  cl->cl_is_tracked = 0;
   lock_release(&sv->sv_list_lock);
 }
 
@@ -635,7 +632,6 @@ static void server_cleanup_client_data(struct server_data* sv,
 
 static BOOL server_post_acceptex_with_client(struct server_data* sv,
                                              struct client* cl) {
-
   for (;;) {
     DWORD bytes_transfered;
     int err_code;
@@ -781,6 +777,8 @@ static void server_cleanup_and_shutdown(struct server_data* sv) {
   lock_destroy(&sv->sv_list_lock);
   STATS_DUMP((&sv->sv_stats));
   STATS_UNINITIALIZE((&sv->sv_stats));
+  sv->sv_allocator->al_dump_statistics(sv->sv_allocator, 
+                                       GetStdHandle(STD_OUTPUT_HANDLE));
   SetConsoleCtrlHandler(server_control_handler, FALSE);
   WSACleanup();
 }
@@ -924,7 +922,8 @@ static BOOL server_transmit_resource(struct server_data* sv,
             cl->cl_buffer,
             kClientIOBuffSize,
             kHTTPResponseArray[kHTTPCode200Ok].http_string_spec,
-            f_size.QuadPart);
+            f_size.QuadPart,
+            kHTTPContentTypeTextHtml);
         cl->cl_ts_buffers.Head = cl->cl_buffer;
         cl->cl_ts_buffers.HeadLength = header_length;
       } else {
@@ -1074,12 +1073,6 @@ static void server_work_loop_ex(struct server_data* sv) {
     ULONG             completed_operation_count = 0;
     BOOL              result;
 
-    /*
-     * I think that by using GetQueuedCompletionStatusEx() we might get
-     * some performance gains especially when serving many clients.
-     * TODO : profile this and if true use it instead of
-     * GetQueuedCompletionStatus().
-     */
     result = GetQueuedCompletionStatusEx(sv->sv_iocp,
                                          completed_operations,
                                          _countof(completed_operations),

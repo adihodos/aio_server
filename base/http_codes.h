@@ -7,6 +7,8 @@ struct http_response {
   size_t      string_spec_len;
 };
 
+extern const char* const kHTTPContentTypeTextHtml; 
+
 extern struct http_response kHTTPResponseArray[];
 
 typedef enum {
