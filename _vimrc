@@ -7,7 +7,7 @@ set nocompatible
 "colorscheme vividchalk
 "colorscheme jellybeans
 set ff=unix
-colorscheme candy
+colorscheme ir_black
 set matchpairs+={:},(:),[:],<:>
 set guioptions=gR
 set showtabline=2
@@ -36,8 +36,12 @@ set foldmethod=indent
 set foldenable
 set foldminlines=50
 set foldopen=all
-"set guifont=Consolas:h14
-set guifont=Dina:h12
+if has("win32")
+  set guifont=Consolas:h14
+endif
+if has("unix")
+  set guifont=Liberation\ Mono\ 12
+endif
 set history=100
 set ruler
 set scrolloff=2
