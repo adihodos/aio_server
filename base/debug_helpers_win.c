@@ -147,6 +147,7 @@ static LONG __stdcall aio_srv_unhandled_exceptions_filter(
                          FILE_ATTRIBUTE_NORMAL,
                          NULL);
   if (INVALID_HANDLE_VALUE == dump_file) {
+    OutputDebugString("Failed to create dump file!");
     goto FINISH;
   }
 
@@ -154,6 +155,7 @@ static LONG __stdcall aio_srv_unhandled_exceptions_filter(
   mdeinfo.ThreadId = GetCurrentThreadId();
   mdeinfo.ExceptionPointers = eptrs;
 
+  OutputDebugString("Writing dump file!");
   MiniDumpWriteDump(GetCurrentProcess(),
                     GetCurrentProcessId(),
                     dump_file,

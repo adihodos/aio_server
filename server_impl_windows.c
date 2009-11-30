@@ -20,7 +20,6 @@
 #include <windows.h>
 #include <tchar.h>
 #include <process.h>
-#include "base/basetypes.h"
 #include "base/debug_helpers.h"
 #include "base/allocator.h"
 #include "base/linked_list.h"
@@ -43,9 +42,10 @@
 
 /*!
  * Since we cannot pass any user defined arguments to SetConsoleCtrlHandler() we
- * need to use this global handle to signal CTRL-C/LOGON/LOGOFF events.
+ * need to use this global handles to signal CTRL-C/LOGON/LOGOFF events.
  */
 static HANDLE iocp_handle;
+static HANDLE iocp_accept_handle;
 
 /*!
  * Options for server.
@@ -77,8 +77,7 @@ typedef enum {
   kIOOpcodeConnection   = 0x00,
   kIOOpcodeSockRead     = 0x01,
   kIOOpcodeSockWrite    = 0x02,
-  kIOOpcodeFileRead     = 0x03, /* unused */
-  kIOOpcodeFileWrite    = 0x04  /* unused */
+  kIOOpcodeSock0BytesRecv = 0x03
 } kIOOpcode;
 
 typedef enum {
@@ -97,8 +96,15 @@ struct aio_data {
 };
 
 typedef enum {
-  kIocpMsgShutDown = 0x00
+  kIocpMsgShutDown = 0x00,
+  kIocpMsgPostAccept = 0x01
 } kIocpMessage;
+
+typedef enum {
+  kAcceptExResultSuccess = 0x00,
+  kAcceptExResultConnReset = 0x01,
+  kAcceptExResultFailed = 0x02
+} kAcceptExResult;
 
 /*!
  * @brief Abstract representation of the server.
@@ -117,8 +123,15 @@ struct server_data {
    */
   HANDLE                    sv_iocp;
   /*!
-   * Array of worker threads. The decision to create one thread/processor is
-   * only a heuristic. 
+   * Completion port for the accept thread.
+   */
+  HANDLE                    sv_iocp_accept;
+  /*
+   * Number of outstanding AcceptEx() calls.
+   */
+  atomic32_t                sv_outstanding_accepts;
+  /*!
+   * Array of worker threads.
    */
   HANDLE*                   sv_worker_threads;
   /*!
@@ -149,6 +162,9 @@ struct server_data {
    * Lock to serialize access to the client list.
    */
   os_lock_t                 sv_list_lock;
+  /*!
+   * Enable some statistics if compiled with __ENABLE_STATISTICS__.
+   */
   SERVER_STATISTICS_STRUCT_MEMBER_ENTRY(sv_stats)
 };
 
@@ -166,7 +182,7 @@ struct client {
   SOCKET                cl_sock;
   SOCKADDR_STORAGE      cl_sadata;
   /*!
-   * Buffer for read/write operations.
+   * Buffer for read/write operations. Make this a multiple of the page size.
    */
   void*                 cl_buffer;
   /*!
@@ -218,6 +234,12 @@ static void server_handle_client_write_completion(struct server_data* sv,
 static void server_cleanup_client_data(struct server_data* sv, 
                                        struct client* cl,
                                        kClientCloseOpt close_opt);
+
+static BOOL server_accept_more_clients(struct server_data* sv,
+                                       struct client* cl,
+                                       kClientCloseOpt);
+
+static int server_accept_loop(struct server_data* srv_ptr);
 
 /*
  * Entry point function for worker threads. We must use _beginthreadex() 
@@ -305,6 +327,7 @@ static BOOL WINAPI server_control_handler(DWORD ctrl_type) {
   switch (ctrl_type) {
   case CTRL_LOGOFF_EVENT : case CTRL_SHUTDOWN_EVENT :
     PostQueuedCompletionStatus(iocp_handle, 0, kIocpMsgShutDown, 0);
+    PostQueuedCompletionStatus(iocp_accept_handle, 0, kIocpMsgShutDown, 0);
     break;
 
   default :
@@ -313,6 +336,7 @@ static BOOL WINAPI server_control_handler(DWORD ctrl_type) {
                            "Confirm shutdown",
                            MB_OKCANCEL)) {
       PostQueuedCompletionStatus(iocp_handle, 0, kIocpMsgShutDown, 0);
+      PostQueuedCompletionStatus(iocp_accept_handle, 0, kIocpMsgShutDown, 0);
     }
     break;
   }
@@ -412,16 +436,24 @@ BOOL server_init(struct server_data* sv) {
     D_FUNCFAIL_WINAPI(CreateIoCompletionPort);
     goto ERR_CLEANUP;
   }
-  
   iocp_handle = sv->sv_iocp;
   ++rollback; /* level 4 */
+
+  sv->sv_iocp_accept = CreateIoCompletionPort(INVALID_HANDLE_VALUE,
+                                              NULL,
+                                              0,
+                                              0);
+  if (!sv->sv_iocp_accept) {
+    goto ERR_CLEANUP;
+  }
+  iocp_accept_handle = sv->sv_iocp_accept;
+  ++rollback; /* level 5 */
 
   sv->sv_sock = create_server_socket();
   if (INVALID_SOCKET == sv->sv_sock) {
     goto ERR_CLEANUP;
   }
-
-  ++rollback; /* level 5 */
+  ++rollback; /* level 6 */
 
   /*
    * Function pointers for acceptex must be loaded before the socket is added
@@ -490,10 +522,14 @@ ERR_CLEANUP :
    * Fall through is intended here.
    */
   switch (rollback) {
-  case 5 :
+  case 6 :
     BUGSTOP_IF((sv->sv_sock == INVALID_SOCKET), 
                "Should not get here with invalid socket");
     closesocket(sv->sv_sock);
+
+  case 5 :
+    BUGSTOP_IF((!sv->sv_iocp_accept), "Accept iocp can't be NULL!");
+    CloseHandle(sv->sv_iocp_accept);
 
   case 4 :
     BUGSTOP_IF((!sv->sv_iocp), "Should not get here with NULL iocp!");
@@ -631,47 +667,39 @@ static void server_cleanup_client_data(struct server_data* sv,
   sv->sv_allocator->al_mem_release(sv->sv_allocator, cl);
 }
 
-static BOOL server_post_acceptex_with_client(struct server_data* sv,
-                                             struct client* cl) {
-  for (;;) {
-    DWORD bytes_transfered;
-    int err_code;
-    BOOL result = sv->sv_acceptx(sv->sv_sock,
-                                 cl->cl_sock,
-                                 cl->cl_buffer,
-                                 0, /* do not wait for data */
-                                 (DWORD) (sizeof(struct sockaddr_storage) + 16),
-                                 (DWORD) (sizeof(struct sockaddr_storage) + 16),
-                                 &bytes_transfered,
-                                 (OVERLAPPED*) cl);
-    if (result) {
-      return TRUE;
-    }
+static kAcceptExResult server_post_acceptex_with_client(struct server_data* sv,
+                                                        struct client* cl) {
+  DWORD bytes_transfered;
+  int err_code;
+  BOOL result;
 
-    err_code = WSAGetLastError();
-    switch (err_code) {
-    case ERROR_IO_PENDING :
-      return TRUE;
-      break;
-
-    case WSAECONNRESET :
-      /*
-       * Peer closed the connection.
-       */
-      cl = server_init_clientdata(sv, cl, TRUE);
-      if (!cl) {
-        return FALSE;
-      }
-      break;
-
-    default :
-      D_FUNCFAIL_WSAAPI(acceptex());
-      server_cleanup_client_data(sv, cl, kClientCloseAbortative | 
-                                         kClientCloseRemoveFromList);
-      return FALSE;
-      break;
-    }
+  result = sv->sv_acceptx(sv->sv_sock,
+                          cl->cl_sock,
+                          cl->cl_buffer,
+                          0, /* do not wait for data */
+                          (DWORD) (sizeof(struct sockaddr_storage) + 16),
+                          (DWORD) (sizeof(struct sockaddr_storage) + 16),
+                          &bytes_transfered,
+                          (OVERLAPPED*) cl);
+  if (result) {
+    return kAcceptExResultSuccess;
   }
+
+  err_code = WSAGetLastError();
+  switch (err_code) {
+  case ERROR_IO_PENDING :
+    return kAcceptExResultSuccess;
+    break;
+
+  case WSAECONNRESET :
+    return kAcceptExResultConnReset;
+    break;
+
+  default :
+    D_FUNCFAIL_WSAAPI(acceptex);
+    break;
+  }
+  return kAcceptExResultFailed;
 }
 
 /*!
@@ -679,15 +707,9 @@ static BOOL server_post_acceptex_with_client(struct server_data* sv,
  */
 static void server_handle_peer_disconnect(struct server_data* sv,
                                           struct client* cli) {
-  STATS_DECREMENT_CONNECTION_COUNT(&sv->sv_stats); 
-  cli = server_init_clientdata(sv, cli, TRUE);
-  if (!cli) {
-    D_FMTSTRING("Failed to reuse client data!");
-    server_cleanup_client_data(sv, cli, kClientCloseRemoveFromList);
-    return;
+  if (!server_accept_more_clients(sv, cli, 0)) {
+    server_cleanup_client_data(sv, cli, 0);
   }
-
-  server_post_acceptex_with_client(sv, cli);
 }
 
 static BOOL server_read_from_client(struct client* cl) {
@@ -695,9 +717,16 @@ static BOOL server_read_from_client(struct client* cl) {
   DWORD rd_flags = 0;
   int op_result;
 
+  /*
+   * With each OVERLAPPED I/O on the socket, the buffers are locked in memory.
+   * Since the system imposes a limit on the maximum amount of memory that 
+   * can be locked, after a while calls to WSASocket() and socket() will fail
+   * with a WSAENOBUFFS error code. Posting an overlapped WSARecv() with 0 bytes
+   * avoids this situation.
+   */ 
   rd_data.buf = cl->cl_buffer;
-  rd_data.len = kClientIOBuffSize;
-  cl->io_context.aio_opcode = kIOOpcodeSockRead;
+  rd_data.len = 0; 
+  cl->io_context.aio_opcode = kIOOpcodeSock0BytesRecv;
   op_result = WSARecv(cl->cl_sock,
                       &rd_data,
                       1,
@@ -712,49 +741,44 @@ static BOOL server_read_from_client(struct client* cl) {
   return TRUE;
 }
 
-static BOOL server_accept_new_connection(struct server_data* sv,
+static void server_accept_new_connection(struct server_data* sv,
                                          struct client* cl) {
-  struct client* newconn = NULL;
   int result = setsockopt(cl->cl_sock,
                           SOL_SOCKET,
                           SO_UPDATE_ACCEPT_CONTEXT,
                           (const char*) &sv->sv_sock,
                           sizeof(sv->sv_sock));
-  if (result) {
-    D_FUNCFAIL_WSAAPI(setsockopt());
-    cl = server_init_clientdata(sv, cl, TRUE);
-    if (!cl) {
-      return FALSE;
-    }
-    newconn = cl;
-  } else {
-    if (!server_update_completion_port(sv, (HANDLE) cl->cl_sock) ||
-        !server_read_from_client(cl)) {
-      cl = server_init_clientdata(sv, cl, TRUE);
-      if (!cl) {
-        return FALSE;
-      }
-      newconn = cl;
-    } else {
-      STATS_INCREMENT_CONNECTION_COUNT(&sv->sv_stats);
-      newconn = server_init_clientdata(sv, NULL, FALSE);
-      if (!newconn) {
-        D_FMTSTRING("Could not allocate new client!");
-        return FALSE;
-      }
+
+  if (!result && 
+      server_update_completion_port(sv, (HANDLE) cl->cl_sock) &&
+      server_read_from_client(cl)) {
+    /*
+     * Client successfully added to completion port. Decrement the number
+     * of outstanding AcceptEx() calls.
+     */
+    STATS_INCREMENT_CONNECTION_COUNT(&sv->sv_stats);
+    atomic32_increment(&sv->sv_outstanding_accepts, -1);
+    cl = NULL;
+  }
+#if defined(_DEBUG)
+  else {
+    if (result) {
+      D_FUNCFAIL_WSAAPI(setsockopt);
     }
   }
-
+#endif
+      
   /*
-   * Post another acceptex() call
+   * Try to post another AcceptEx() call.
    */
-  return server_post_acceptex_with_client(sv, newconn);
+  if (!server_accept_more_clients(sv, cl, 0) && cl) {
+    server_cleanup_client_data(sv, cl, kClientCloseRemoveFromList);
+  }
 }
 
 static void server_cleanup_and_shutdown(struct server_data* sv) {
   int i = 0;
-  /*struct client* current_client = NULL;*/
-  server_post_message(sv, kIocpMsgShutDown, 0, 0);
+  /*server_post_message(sv, kIocpMsgShutDown, 0, 0);*/
   for (i = 0; i < (int) sv->sv_worker_count; ++i) {
     if (sv->sv_worker_threads[i]) {
       WaitForSingleObject(sv->sv_worker_threads[i], INFINITE);
@@ -775,6 +799,9 @@ static void server_cleanup_and_shutdown(struct server_data* sv) {
   BUGSTOP_IF((!sv->sv_iocp), "Completion port is invalid!");
   CloseHandle(sv->sv_iocp);
 
+  BUGSTOP_IF((!sv->sv_iocp_accept), "Completion port is invalid!");
+  CloseHandle(sv->sv_iocp_accept);
+
   lock_destroy(&sv->sv_list_lock);
   STATS_DUMP((&sv->sv_stats));
   STATS_UNINITIALIZE((&sv->sv_stats));
@@ -785,14 +812,11 @@ static void server_cleanup_and_shutdown(struct server_data* sv) {
 }
 
 static int server_main_loop(struct server_data* sv) {
-  struct client* newconn = NULL;
-
-  newconn = server_init_clientdata(sv, NULL, FALSE);
-  if (!newconn || !server_post_acceptex_with_client(sv, newconn)) {
-    server_post_message(sv, kIocpMsgShutDown, 0, 0);
-    return EXIT_FAILURE;
-  }
-  server_work_loop_ex(sv);
+  /*
+   * Post a conpletion packet to start accepting.
+   */
+  server_accept_more_clients(sv, NULL, 0);
+  server_accept_loop(sv);
   return 0;
 }
 
@@ -806,10 +830,12 @@ int server_start_and_run(int argc, char** argv) {
   int result;
   int i = 0;
 
+  set_unhandled_exceptions_filter();
   sv_options.so_max_clients = kSVDefaultUnlimitedConnections;
   sv_options.so_port = _strdup(kSVDefaultPort);
   sv_options.so_thread_to_processor_ratio = kSVDefaultThreadToProcessorRatio;
   sv_options.so_www_rootdir = _strdup(kSVDefaultWWWRootDir);
+  sv_options.so_max_outstanding_accepts = 64;
 
   while (++i < argc) {
     if (*argv[i] != '-') { 
@@ -837,6 +863,8 @@ int server_start_and_run(int argc, char** argv) {
       if (conn_limit > 0) {
         sv_options.so_max_clients = conn_limit;
       }
+    } else if(!strcmp(argv[i], "max-outstanding-acepts")) {
+      sv_options.so_max_outstanding_accepts = atoi(argv[++i]); 
     } else {
       fprintf_s(stderr, "\nUnrecognized options %s", argv[i]);
     }
@@ -969,8 +997,37 @@ static void server_handle_client_request(struct server_data* sv,
   char* document = NULL;
   char* ver = NULL;
   char* next_token = NULL;
-  struct client* new_client = NULL;
-  UNREFERENCED_PARAMETER(sv);
+  WSABUF rd_buff;
+  DWORD bytes_transferred = 0;
+  DWORD call_flags = 0;
+  int result;
+
+  BUGSTOP_IF((cl->io_context.aio_opcode != kIOOpcodeSock0BytesRecv),
+             "Invalid opcode!");
+  rd_buff.buf = cl->cl_buffer;
+  rd_buff.len = kClientIOBuffSize;
+
+  for (;;) {
+    /*
+     * Just do a blocking receive.
+     */
+    result = WSARecv(cl->cl_sock,
+                     &rd_buff,
+                     1,
+                     &bytes_transferred,
+                     &call_flags,
+                     NULL,
+                     NULL);
+
+    if((result && WSAEWOULDBLOCK != WSAGetLastError()) ||
+       !bytes_transferred) {
+      /*
+       * Either an error has occured or the client closed the connection.
+       */
+      goto FINISH;
+    }
+    break;
+  }
 
   if ((method = strtok_s(buff_request, " ", &next_token)) == NULL  ||
       (document = strtok_s(NULL, " ", &next_token)) == NULL        ||
@@ -979,23 +1036,16 @@ static void server_handle_client_request(struct server_data* sv,
     document = NULL;
   } 
 
-  if (!server_transmit_resource(sv, cl, document)) {
-    /*
-     * Failed to transmit file to client. Reuse the data.
-     */
-    new_client = server_init_clientdata(sv, cl, TRUE);
-  } else {
-    /*
-     * Allocate new client.
-     */
-    new_client = server_init_clientdata(sv, NULL, TRUE);
+  if (server_transmit_resource(sv, cl, document)) {
+    cl = NULL;
   }
-  
+
+FINISH : 
   /*
    * Time to post another AcceptEx().
    */
-  if (new_client) {
-    server_post_acceptex_with_client(sv, new_client);
+  if (!server_accept_more_clients(sv, cl, 0) && cl) {
+    server_cleanup_client_data(sv, cl, kClientCloseRemoveFromList);
   }
 }
 
@@ -1013,11 +1063,17 @@ static kServerAction server_process_completions(struct server_data* sv,
     BUGSTOP_IF((!ptr_client), "Invalid client handle!");
 
     if (!notifications[index].dwNumberOfBytesTransferred && 
-        ptr_client->io_context.aio_opcode != kIOOpcodeConnection) {
+        (ptr_client->io_context.aio_opcode != kIOOpcodeConnection) &&
+        (ptr_client->io_context.aio_opcode != kIOOpcodeSock0BytesRecv)) {
       /*
-       * Client closed connection.
+       * 0 bytes received is allowable on connection and the initial WSARecv()
+       * call. In any other cases it means that the client closed the
+       * connection.
        */
-      server_handle_peer_disconnect(sv, ptr_client);
+      if (!server_accept_more_clients(sv, ptr_client, kClientCloseAbortative) &&
+          ptr_client) {
+        server_cleanup_client_data(sv, ptr_client, kClientCloseRemoveFromList);
+      }
       continue;
     }
 
@@ -1029,7 +1085,7 @@ static kServerAction server_process_completions(struct server_data* sv,
       server_accept_new_connection(sv, ptr_client);
       break;
 
-    case kIOOpcodeSockRead :
+    case kIOOpcodeSock0BytesRecv :
       /*
        * Read of client request is complete. Process the request.
        */
@@ -1103,7 +1159,98 @@ static void client_destructor(void* client_data, void* server_data, void* args) 
 
 static void server_handle_client_write_completion(struct server_data* sv,
                                                   struct client* cl) {
-  if (server_init_clientdata(sv, cl, FALSE)) {
-    server_post_acceptex_with_client(sv, cl);
+  if (!server_accept_more_clients(sv, cl, 0)) {
+    D_FUNCFAIL_WINAPI(PostQueuedCompletionStatus);
+    server_cleanup_client_data(sv, cl, kClientCloseRemoveFromList);
   }
+}
+
+static int server_accept_loop(struct server_data* srv_ptr) {
+  for (;;) {
+    DWORD client_opts = 0;
+    OVERLAPPED* io_ctx = NULL;
+    ULONG_PTR   io_opcode;
+    struct client* cli = NULL;
+    BOOL result = GetQueuedCompletionStatus(srv_ptr->sv_iocp_accept,
+                                            &client_opts,
+                                            &io_opcode,
+                                            (OVERLAPPED**) &io_ctx,
+                                            INFINITE);
+    if (!result) {
+      D_FUNCFAIL_WINAPI(GetQueuedCompletionStatus);
+      continue;
+    }
+
+    if (io_opcode == kIocpMsgShutDown) {
+      break;
+    }
+
+    for (cli = (struct client*) io_ctx; 
+         atomic32_load(&srv_ptr->sv_outstanding_accepts) < 
+         sv_options.so_max_outstanding_accepts;
+         cli = NULL) {
+
+      if (!cli) {
+        /*
+         * Allocate new client.
+         */
+        cli = server_init_clientdata(srv_ptr, NULL, FALSE);
+      } else {
+        /*
+         * Reuse existing client structure.
+         */
+        cli = server_init_clientdata(srv_ptr, cli, client_opts);
+      }
+
+      if (!cli) {
+        /*
+         * We're running low on resources. Bail out.
+         */
+        D_FMTSTRING("Client allocation/reinit failed!");
+        break;
+      }
+
+      for(;;) {
+        kAcceptExResult ret_code = server_post_acceptex_with_client(srv_ptr, 
+                                                                    cli);
+        switch (ret_code) {
+          case kAcceptExResultSuccess :
+            atomic32_increment(&srv_ptr->sv_outstanding_accepts, 1);
+            break;
+
+          case kAcceptExResultConnReset :
+            /*
+             * Client closed connection. Try to reuse the data and post another
+             * AcceptEx().
+             */
+            cli = server_init_clientdata(srv_ptr, cli, TRUE);
+            if (cli) {
+              continue;
+            } else {
+              break;
+            }
+            break;
+
+          case kAcceptExResultFailed :
+            server_cleanup_client_data(srv_ptr, cli, kClientCloseRemoveFromList);
+            break;
+
+          default :
+            break;
+        }
+        break;
+      }
+    }
+  }
+
+  return 0;
+}
+
+static BOOL server_accept_more_clients(struct server_data* sv_ptr,
+                                       struct client* cl,
+                                       kClientCloseOpt options) {
+  return PostQueuedCompletionStatus(sv_ptr->sv_iocp_accept,
+                                    options,
+                                    kIocpMsgPostAccept,
+                                    (OVERLAPPED*) cl);
 }
