@@ -90,6 +90,7 @@ static void* dlinked_list_internal_remove_node(struct dlinked_list* list,
                                                struct list_node* node) {
   void* node_data = NULL;
   BUGSTOP_IF((node == list->dl_sentinel), "Trying to delete sentinel node!");
+  BUGSTOP_IF((!list->dl_items), "Item count mismatch!");
 
   node->n_link[kRightLink]->n_link[kLeftLink] = node->n_link[kLeftLink];
   node->n_link[kLeftLink]->n_link[kRightLink] = node->n_link[kRightLink];
@@ -205,13 +206,12 @@ void* dlist_remove_item(dlinked_list_handle list_handle,
   BUGSTOP_IF((!item), "Invalid parameter");
 
   curr_node = list->dl_sentinel->n_link[kRightLink];
-  for (; ;) {
+  for (;;) {
     if (curr_node == list->dl_sentinel) {
       return NULL;
     }
 
     if (list->dl_comparator(curr_node->n_data, item, list->dl_userdata) == 0 ) {
-      --list->dl_items;
       return dlinked_list_internal_remove_node(list, curr_node);
     }
     curr_node = curr_node->n_link[kRightLink];
@@ -241,7 +241,7 @@ void dlist_destroy(dlinked_list_handle list_handle) {
   BUGSTOP_IF((!list_handle), "Invalid parameter!");
 
   curr_node = list->dl_sentinel->n_link[kRightLink];
-  for (; ;) {
+  for (;;) {
     struct list_node* old_node = curr_node;
     if (curr_node == list->dl_sentinel) {
       break;

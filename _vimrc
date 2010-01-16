@@ -6,8 +6,9 @@ set nocompatible
 "colorscheme vibrantink
 "colorscheme vividchalk
 "colorscheme jellybeans
+let g:load_doxygen_syntax=1
 set ff=unix
-colorscheme ir_black
+colorscheme rdark
 set matchpairs+={:},(:),[:],<:>
 set guioptions=gR
 set showtabline=2
@@ -37,7 +38,7 @@ set foldenable
 set foldminlines=50
 set foldopen=all
 if has("win32")
-  set guifont=Consolas:h14
+  set guifont=Consolas:h11
 endif
 if has("unix")
   set guifont=Liberation\ Mono\ 12
@@ -85,7 +86,11 @@ set completeopt=menuone,menu,longest,preview
 
 " build tags of your own project with CTRL+F12
 map <C-F12> :!ctags -R --c++-kinds=+p --fields=+iaS --extra=+q .<CR>
-
+map <C-O> :A <CR>
+map <C-O><C-H> :AS <CR>
+map <C-O><C-V> :AV <CR>
+map <C-O><C-T> :AT <CR>
+ 
 " OmniCppComplete
 let OmniCpp_NamespaceSearch = 1
 let OmniCpp_GlobalScopeSearch = 1
