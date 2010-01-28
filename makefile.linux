@@ -1,7 +1,8 @@
 SRC_BASE = base
 HDR_BASE = ../base
 OUTDIR  = build_files
-OBJECTS = $(OUTDIR)/s_main.o                      \
+OBJECTS = $(OUTDIR)/server_main.o									\
+					$(OUTDIR)/server_impl_linux.o           \
           $(OUTDIR)/debug_helpers_linux.o         \
           $(OUTDIR)/linked_list.o                 \
           $(OUTDIR)/allocator.o
@@ -12,29 +13,36 @@ CFLAGS  = -std=c99 -Wall -Werror -pedantic-errors -O0 -ggdb3 -D__OS_LINUX__ \
           -D__DEBUG_ENABLED__ -D_GNU_SOURCE -rdynamic -I$(HDR_BASE)
 
 $(TARGET) : $(OUTDIR) $(OBJECTS) 
-  $(CC) $(CFLAGS) $(OBJECTS) -o $@
+	  $(CC) $(CFLAGS) $(OBJECTS) -o $@
 
 $(OUTDIR) :                           
-  if [ ! -e "$(OUTDIR)" ]; then \
-    mkdir "$(OUTDIR)";          \
-  fi                                                              
+	if [ ! -e "$(OUTDIR)" ]; then \
+		mkdir "$(OUTDIR)";          \
+	fi                                                              
 
-$(OUTDIR)/s_main.o :                                    \
-  s_main.c                                              \
-  $(SRC_BASE)/debug_helpers.h                           \
+$(OUTDIR)/server_main.o :																\
+	server.h																							\
+	server_main.c																					\
+	server_impl_linux.c
+	$(CC) $(CFLAGS) $< -c -o $@
+
+$(OUTDIR)/server_impl_linux.o :                         \
+	server.h																							\
+  server_impl_linux.c																		\
+	$(SRC_BASE)/debug_helpers.h                           \
   $(SRC_BASE)/debug_helpers_linux.c                     \
   $(SRC_BASE)/basetypes.h                               \
   $(SRC_BASE)/atomic.h                                  \
   $(SRC_BASE)/atomic_gcc.h                              \
   $(SRC_BASE)/linked_list.h                             \
   $(SRC_BASE)/linked_list.c
-  $(CC) $(CFLAGS) $< -c -o $@ 
+	$(CC) $(CFLAGS) $< -c -o $@ 
 
 $(OUTDIR)/debug_helpers_linux.o :                       \
   $(SRC_BASE)/debug_helpers_linux.c                     \
   $(SRC_BASE)/debug_helpers.h                           \
   $(SRC_BASE)/basetypes.h
-  $(CC) $(CFLAGS) $< -c -o $@
+	$(CC) $(CFLAGS) $< -c -o $@
 
 $(OUTDIR)/linked_list.o :                               \
   $(SRC_BASE)/linked_list.c                             \
@@ -44,7 +52,7 @@ $(OUTDIR)/linked_list.o :                               \
   $(SRC_BASE)/debug_helpers.h                           \
   $(SRC_BASE)/debug_helpers_linux.c                     \
   $(SRC_BASE)/basetypes.h
-  $(CC) $(CFLAGS) $< -c -o $@   
+	$(CC) $(CFLAGS) $< -c -o $@   
 
 $(OUTDIR)/allocator.o :                                 \
   $(SRC_BASE)/allocator.c                               \
@@ -54,9 +62,9 @@ $(OUTDIR)/allocator.o :                                 \
   $(SRC_BASE)/atomic_gcc.h                              \
   $(SRC_BASE)/debug_helpers.h                           \
   $(SRC_BASE)/debug_helpers_linux.c
-  $(CC) $(CFLAGS) $< -c -o $@
+	$(CC) $(CFLAGS) $< -c -o $@
 
 .PHONY : clean
 clean :
-  -@rm -fv $(OUTDIR)/*.*
+	-@rm -fv $(OUTDIR)/*.*
 
