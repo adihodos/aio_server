@@ -21,14 +21,14 @@ $(OUTDIR) :
 	fi                                                              
 
 $(OUTDIR)/server_main.o :																\
-	server.h																							\
 	server_main.c																					\
+	server.h																							\
 	server_impl_linux.c
 	$(CC) $(CFLAGS) $< -c -o $@
 
 $(OUTDIR)/server_impl_linux.o :                         \
-	server.h																							\
   server_impl_linux.c																		\
+	server.h																							\
 	$(SRC_BASE)/debug_helpers.h                           \
   $(SRC_BASE)/debug_helpers_linux.c                     \
   $(SRC_BASE)/basetypes.h                               \

@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include "base/basetypes.h"
 #include "base/debug_helpers.h"
+#include "server.h"
 
 static const char* const kDefaultServerPort = "27015";
 
@@ -32,17 +33,28 @@ typedef enum {
   kDataTypeU64 /* __uint64_t */
 } kDataTypes;
 
+typedef enum {
+  kObjectTypeServer,
+  kObjectTypeClient,
+  kObjectTypeSignal
+} kObjectType;
+
 struct io_context {
   struct epoll_event io_ctx_data;
   int io_ctx_objtype;
   int io_ctx_opcode;
 };
 
+struct signal_data {
+  struct io_context context;
+  int    sigfd;
+};
+
 struct server {
   struct io_context context;
   int sv_acceptfd;
   int sv_epollfd;
-  int sv_termsigfd;
+  struct signal_data sv_termsig;
 };
 
 struct client {
@@ -50,6 +62,7 @@ struct client {
   int cl_sockfd;
   int cl_filefd;
 };
+
 
 static int server_init(struct server* p_srv);
 
@@ -65,8 +78,8 @@ static int create_server_socket(void);
  *@param epoll_fd Epoll instance descriptor.
  *@param fd Descriptor to add.
  *@param event_flags Events to receive for the descriptor fd.
- *@datatype See kDataTypes enumeration for valid values.
- *@vararg Data to be associated with fd.
+ *@param datatype See kDataTypes enumeration for valid values.
+ *@param varargs Data to be associated with fd.
  *@return See man page of epoll_ctl().
  */
 static int add_fd_to_epoll(
@@ -76,6 +89,15 @@ static int add_fd_to_epoll(
     int datatype, 
     ...);
 
+/*!
+ * @brief
+ */
+static void server_start_accepting_clients(struct server* srv_ptr);
+
+static int server_process_event(struct server* srv_ptr, 
+                                struct epoll_event* event);
+
+static void server_cleanup(struct server* srv_ptr);
 
 int server_start_and_run(int UNUSED_POST(argc), char** UNUSED_POST(argv)) {
   struct server srv;
@@ -83,6 +105,8 @@ int server_start_and_run(int UNUSED_POST(argc), char** UNUSED_POST(argv)) {
     D_FMTSTRING("Failed to initialize the server!", "");
   } else {
     D_FMTSTRING("Server initialized ok!", "");
+    server_start_accepting_clients(&srv);
+    server_cleanup(&srv);
   }
   return 0;
 }
@@ -90,9 +114,10 @@ int server_start_and_run(int UNUSED_POST(argc), char** UNUSED_POST(argv)) {
 static int server_init(struct server* p_srv) {
   assert(p_srv);
   memset(p_srv, 0, sizeof(*p_srv));
-  p_srv->sv_acceptfd = p_srv->sv_epollfd = p_srv->sv_termsigfd = -1;
-  /*p_srv->context->io_ctx_data.data.ptr = p_srv;*/
-  /*p_srv->context->io_ctx_data.data.events = EPOLLIN | EPOLLET | EPOLLRDHUP;*/
+  p_srv->context.io_ctx_objtype = kObjectTypeServer;
+  p_srv->sv_acceptfd = p_srv->sv_epollfd = -1;
+  p_srv->sv_termsig.sigfd = -1;
+  p_srv->sv_termsig.context.io_ctx_objtype = kObjectTypeSignal;
 
   size_t rollback = 0;
   p_srv->sv_acceptfd = create_server_socket();
@@ -124,14 +149,26 @@ static int server_init(struct server* p_srv) {
   if (-1 == sigprocmask(SIG_BLOCK, &sig_mask, NULL)) {
     goto ERR_CLEANUP;
   }
-  p_srv->sv_termsigfd = signalfd(-1, &sig_mask, SFD_NONBLOCK);
-  if (-1 == p_srv->sv_termsigfd) {
+  p_srv->sv_termsig.sigfd = signalfd(-1, &sig_mask, SFD_NONBLOCK);
+  if (-1 == p_srv->sv_termsig.sigfd) {
     goto ERR_CLEANUP;
   }
   /*
    * Level 3 - signal descriptor for SIGINT allocated.
    */
   ++rollback;
+
+  /*
+   * Add termination signal and accept socket to epoll interface.
+   */
+  if (-1 == add_fd_to_epoll(p_srv->sv_epollfd,
+                            p_srv->sv_termsig.sigfd,
+                            EPOLLIN | EPOLLET,
+                            kDataTypePTR,
+                            &p_srv->sv_termsig)) {
+    goto ERR_CLEANUP;
+  }
+
   if (-1 == add_fd_to_epoll(p_srv->sv_epollfd,
                             p_srv->sv_acceptfd,
                             EPOLLIN | EPOLLET | EPOLLRDHUP,
@@ -145,8 +182,8 @@ static int server_init(struct server* p_srv) {
  ERR_CLEANUP :
   switch (rollback) {
   case 3 :
-    close (p_srv->sv_termsigfd);
-    p_srv->sv_termsigfd = -1;
+    close (p_srv->sv_termsig.sigfd);
+    p_srv->sv_termsig.sigfd = -1;
 
   case 2 :
     close (p_srv->sv_epollfd);
@@ -260,4 +297,59 @@ static int add_fd_to_epoll(
 
   edata.events = event_flags;
   return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &edata);
+}
+
+static void server_start_accepting_clients(struct server* srv_ptr) {
+  struct epoll_event rec_events[kMaxEpollCompletionEntries];
+  int should_quit = 0;
+  for (; !should_quit;) {
+    int rec_count = epoll_wait(srv_ptr->sv_epollfd, 
+                               rec_events, 
+                               kMaxEpollCompletionEntries,
+                               -1);
+    if (-1 == rec_count) {
+      if (EINTR != errno) {
+        break;
+      }
+      continue;
+    }
+
+    for (int i = 0; i < rec_count && !should_quit; ++i) {
+      should_quit = server_process_event(srv_ptr, &rec_events[i]);
+    }
+  }
+}
+
+static int server_process_event(struct server* srv_ptr, 
+                                struct epoll_event* event) {
+  struct io_context* ctx = (struct io_context*) event->data.ptr;
+  switch (ctx->io_ctx_objtype) {
+    case kObjectTypeSignal :
+      fputs("\nGot SIGQUIT", stdout);
+      return 1;
+      break;
+
+    case kObjectTypeServer :
+      // handle incoming connection
+      return 0;
+      break;
+
+    case kObjectTypeClient :
+      // handle event on client socket
+      return 0;
+      break;
+
+    default :
+      D_FMTSTRING("Unknown event, object type %d, code %d", 
+                  ctx->io_ctx_objtype,
+                  ctx->io_ctx_opcode);
+      return 0;
+      break;
+  }
+}
+
+static void server_cleanup(struct server* srv_ptr) {
+  close(srv_ptr->sv_acceptfd);
+  close(srv_ptr->sv_termsig.sigfd);
+  close(srv_ptr->sv_epollfd);
 }
