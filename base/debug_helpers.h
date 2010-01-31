@@ -55,7 +55,8 @@ static inline void debug_break(void) {
 
 #define D_FUNCFAIL(funcname, errcode, descr, ...)                               \
   output_formatted_string_to_debugger(__FILE__,                                 \
-                                      __LINE__,                                 \                                                                   "Function %s failed, error %d" descr,     \
+                                      __LINE__,                                 \
+                                      "Function %s failed, error %d" descr,     \
                                       #funcname,                                \
                                       errcode,                                  \
                                       ##__VA_ARGS__)
