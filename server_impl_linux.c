@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <mqueue.h>
 #include <netdb.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -13,13 +14,23 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include "base/allocator.h"
 #include "base/basetypes.h"
 #include "base/debug_helpers.h"
+#include "base/eintr_wrapper.h"
+#include "base/linked_list.h"
 #include "server.h"
 
 static const char* const kDefaultServerPort = "27015";
 
 static const size_t kMaxEpollCompletionEntries = 16;
+
+/*!
+ * @brief Max number of messages we can place into a message queue.
+ */
+static const long kMessageQueueMaxMsgCount = 10000;
+
+static struct allocator* sv_default_allocator = allocator_handle;
 
 /*!
  * @brief Valid data types that can be associated with a file descriptor and
@@ -45,6 +56,18 @@ struct io_context {
   int io_ctx_opcode;
 };
 
+struct message {
+  int msg_code;
+  union {
+    void*     msg_ptr;
+    int       msg_fd;
+    uint32_t  msg_u32;
+    uint64_t  msg_u64;
+  } msg_data;
+};
+
+static const long kMessageQueueMaxMsgSize = (long) sizeof(message);
+
 struct signal_data {
   struct io_context context;
   int    sigfd;
@@ -63,8 +86,74 @@ struct client {
   int cl_filefd;
 };
 
+struct worker_thread {
+  int                 wk_epoll_fds;
+  mqd_t               wk_mqueue_fds;
+  dlinked_list_handle wk_clients;
+  char*               wk_mqueue_name;
+};
 
-static int server_init(struct server* p_srv);
+/*!
+ * @brief Main function of a worker thread.
+ * @param args Pointer to a worker_thread structure.
+ * @return Not used.
+ */
+static
+void*
+worker_thread_proc(void* args);
+
+/*!
+ * @brief Allocates and initializes a worker_thread structure.
+ * @param mqueue_name Name to use for the thread's message queue.
+ * @return Pointer to worker_thread* structure on success, NULL on fail.
+ * @remarks When no longer needed call worker_thread_destroy() on the object.
+ */
+static
+struct worker_thread*
+worker_thread_create(const char* mqueue_name);
+
+/*!
+ * @brief Frees all resources prieviously allocated with a call ro
+ * worker_thread_create. 
+ */
+static
+void
+worker_thread_destroy(struct worker_thread* data);
+
+/*!
+ * @brief Gets a file descriptor for the message queue of the thread.
+ * @return File descriptor on success, (mqd_t) -1 on failure.
+ * @remarks Call mq_close() on the returned descriptor when not needed anymore.
+ */
+static
+mqd_t
+worker_thread_get_message_queue_fds(const struct worker_thread* wkthread);
+
+/*!
+ * @brief Simple function to compare clients in a linked list.
+ * @return 0 if equal, 1 if client @xparam > client @yparam, -1 otherwise.
+ */
+static
+inline
+void
+client_compare(const void* xparam, const void* yparam, void*) {
+  assert(xparam);
+  assert(yparam);
+  const struct client* c_left = (const struct client*) xparam;
+  const struct client* c_right = (const struct client*) yparam;
+
+  if (c_left->cl_sockfd == c_right->cl_sockfd) {
+    return 0;
+  } else if (c_left->cl_sockfd > c_right->cl_sockfd) {
+    return 1;
+  } else {
+    return -1;
+  }
+}
+
+static 
+int 
+server_init(struct server* p_srv);
 
 /*!
  *@brief Creates the socket used to accept connections.
@@ -110,6 +199,161 @@ int server_start_and_run(int UNUSED_POST(argc), char** UNUSED_POST(argv)) {
   }
   return 0;
 }
+
+static
+void*
+worker_thread_proc(void* args) {
+  /*
+   * @@Not implemented.
+   */
+  return NULL;
+}
+
+static
+struct worker_thread*
+worker_thread_create(const char* mqueue_name) {
+  /*
+   * Each worker thread has an epoll descriptor where it multiplexes
+   * socket/message_queue descriptors. Also each worker thread has
+   * a message queue where it retrieves notifications about new client
+   * connections. Once a client has been accept()'ed, the socket is
+   * sent to a worker thread via the message queue.
+   * The thread will take ownership of the client, serve it and free
+   * all the allocated resources when the client disconnects.
+   */
+  assert(mqueue_name);
+
+  struct worker_thread* wthread = malloc(sizeof(struct worker_thread));
+  if (!wthread) {
+    D_FUNCFAIL_ERRNO(malloc);
+    return NULL;
+  }
+  /*
+   * Level 1 - memory for structure allocated.
+   */
+  int rollback = 1;
+
+  /*
+   * This list is used to keep track of all the clients that are served
+   * by this thread. Once a client pointer arrives via the message queue
+   * it is put into this list. The client gets removed when it disconnects
+   * or when there's an error on the socket.
+   */
+  wthread->wk_clients = dlist_create(client_compare, 
+                                     sv_default_allocator, 
+                                     wthread);
+  if (!wthread->wk_clients)
+    goto ERR_CLEANUP;
+
+  /*
+   * Level 2 - client list created.
+   */
+  ++rollback;
+
+  wthread->wk_mqueue_name = strdup(mqueue_name);
+  if (!wthread->wk_mqueue_name) {
+    D_FUNCFAIL_ERRNO(strdup);
+    goto ERR_CLEANUP;
+  
+  }
+  /*
+   * Level 3 - memory for queue name allocated.
+   */
+  ++rollback;
+
+  wthread->wk_epoll_fds = HANDLE_EINTR_ON_SYSCALL(
+      epoll_create(kMaxEpollCompletionEntries));
+  if (wthread->wk_epoll_fds == -1) {
+    D_FUNCFAIL_ERRNO(epoll_create);
+    goto ERR_CLEANUP;
+  }
+
+  /*
+   * Level 4 - epoll descriptor allocated.
+   */
+  ++rollback;
+
+  /*
+   * The message queue we use is uni-directional. We only read from it
+   * and we never write back anything. Note that the call to mq_open
+   * will fail with EINVAL if the program is not run as superuser and
+   * the values of mq_msgsize or mq_maxmsg are greater than those
+   * specified in /proc/sys/fs/mqueue/msgsize_max and
+   * /proc/sys/fs/mqueue/msg_max.
+   */
+  mq_attr queue_attributes = { 0 };
+  mq_attr.mq_flags = O_NONBLOCK; 
+  mq_attr.mq_maxmsg = kMessageQueueMaxMsgCount;
+  mq_attr.mq_msgsize = kMessageQueueMaxMsgSize;
+
+  wthread->wk_mqueue_fds = HANDLE_EINTR_ON_SYSCALL(
+      mq_open(wthread->wk_mqueue_name,
+              /*
+               * Fail if there's already a queue opened with this name,
+               * each thread must have its unique queue.
+               */
+              O_RDONLY | O_EXCL | O_CREAT, 
+              S_IRWXU | S_IRGRP | S_IROTH,
+              &queue_attributes));
+  if (wthread->wk_mqueue_fds == (mqd_t) -1) {
+    D_FUNCFAIL_ERRNO(mq_open);
+    goto ERR_CLEANUP;
+  }
+
+  /*
+   * Level 5 - Message queue created.
+   */
+  ++rollback;
+
+  /*
+   * Add fd to epoll.
+   */
+
+  return wthread;
+
+ERR_CLEANUP :
+  /*
+   * Fall-through is intended here.
+   */
+  switch (rollback) {
+    case 5 :
+      mq_close(wthread->wk_mqueue_fds);
+
+    case 4 :
+      close(wthread->wk_epoll_fds);
+
+    case 3 :
+      free(wthread->wk_mqueue_name);
+
+    case 2 :
+      dlist_destroy(wthread->wk_clients);
+
+    case 1 :
+      free(wthread);
+
+    default :
+      break;
+  }  
+  return NULL;
+}
+
+/*!
+ * @brief Frees all resources prieviously allocated with a call ro
+ * worker_thread_create. 
+ */
+static
+void
+worker_thread_destroy(struct worker_thread* data);
+
+/*!
+ * @brief Gets a file descriptor for the message queue of the thread.
+ * @return File descriptor on success, (mqd_t) -1 on failure.
+ * @remarks Call mq_close() on the returned descriptor when not needed anymore.
+ */
+static
+mqd_t
+worker_thread_get_message_queue_fds(const struct worker_thread* wkthread);
+
 
 static int server_init(struct server* p_srv) {
   assert(p_srv);
