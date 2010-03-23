@@ -9,8 +9,9 @@ OBJECTS = $(OUTDIR)/server_main.o									\
 TARGET  = $(OUTDIR)/aio_server
 
 CC      = gcc
-CFLAGS  = -std=c99 -Wall -Werror -pedantic-errors -O0 -ggdb3 -D__OS_LINUX__ \
-          -D__DEBUG_ENABLED__ -D_GNU_SOURCE -rdynamic -I$(HDR_BASE)
+CFLAGS  = -std=c99 -Wall -Werror -Wextra -O0 -ggdb3 -D__OS_LINUX__ \
+          -D__DEBUG_ENABLED__ -D_GNU_SOURCE -rdynamic -I$(HDR_BASE) \
+					-lrt -lpthread
 
 $(TARGET) : $(OUTDIR) $(OBJECTS) 
 	  $(CC) $(CFLAGS) $(OBJECTS) -o $@

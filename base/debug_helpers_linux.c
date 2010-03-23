@@ -51,7 +51,13 @@ void output_formatted_string_to_debugger(const char* file,
   write(STDERR_FILENO, "\n", 1);
 }
 
-static void linux_sigsegv_handler(int signum, siginfo_t* sidata, void* ctx) {
+static 
+void 
+linux_sigsegv_handler(
+    int UNUSED_POST(signum), 
+    siginfo_t* sidata, 
+    void* ctx) 
+{
   ucontext_t* ctxptr = ctx;
   char buff_msg[1024];
 
