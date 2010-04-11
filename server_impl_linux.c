@@ -15,6 +15,7 @@
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include "base/allocator.h"
@@ -73,10 +74,17 @@ struct message {
   } msg_data;
 };
 
+typedef enum  {
+  /*
+   * struct message contains a file descriptor.
+   */
+  kITTMessageAddClient
+} kITTMessageCodes;
+
 /*!
  * @brief Max number of messages we can place into a message queue.
  */
-static const long kMessageQueueMaxMsgCount = 10000;
+static const long kMessageQueueMaxMsgCount = 10;
 
 static const long kMessageQueueMaxMsgSize = (long) sizeof(struct message);
 
@@ -105,6 +113,7 @@ struct worker_thread {
   pthread_t             wk_threadid;
   int                   wk_readyevent;
   int                   wk_rollback;
+  int                   wk_quitflag;
 };
 
 /*!
@@ -126,11 +135,54 @@ static const size_t kClientIOBuffSize = 2048;
 
 struct client {
   struct object_identity context;
-  int   cl_sockfd;
-  int   cl_filefd;
-  void* cl_buffer;
+  int    cl_sockfd;
+  int    cl_filefd;
+  void*  cl_buffer;
+  int    cl_rollback;
 };
 
+static
+struct client*
+client_create(
+    int sock_fds,
+    struct allocator* alc
+    )
+{
+  struct client* cl = alc->al_mem_alloc(alc, sizeof(struct client));
+  if (!cl) {
+    return NULL;
+  }
+
+  cl->context.objid_type = kObjectTypeClient;
+  cl->cl_sockfd = sock_fds;
+  cl->cl_filefd = -1;
+  cl->cl_buffer = alc->al_mem_alloc(alc, kClientIOBuffSize);
+  if (!cl->cl_buffer) {
+    goto ERR_CLEANUP;
+  }
+
+  return cl;
+
+ERR_CLEANUP :
+  HANDLE_EINTR_ON_SYSCALL(close(sock_fds));
+  alc->al_mem_release(alc, cl);
+  return NULL;
+}
+
+static
+void
+client_destroy(
+    struct client* clnt,
+    struct allocator* alc
+    )
+{
+  if (clnt->cl_filefd != -1)
+    HANDLE_EINTR_ON_SYSCALL(close(clnt->cl_filefd));
+  if (clnt->cl_sockfd != -1)
+    HANDLE_EINTR_ON_SYSCALL(close(clnt->cl_sockfd));
+  alc->al_mem_release(alc, clnt->cl_buffer);
+  alc->al_mem_release(alc, clnt);
+}
 
 /*!
  * @brief Main function of a worker thread.
@@ -178,6 +230,82 @@ void
 worker_thread_destroy(
     struct worker_thread* data
     );
+
+static
+void
+worker_thread_handle_event(
+    struct worker_thread* state,
+    struct epoll_event* ev_data
+    );
+
+static
+inline
+void
+worker_thread_handle_signal_event(
+    struct worker_thread* state,
+    struct signal_object* UNUSED_POST(sig),
+    uint32_t UNUSED_POST(event_flags))
+{
+  /*
+   * Don't bother reading anything from the signal descriptor, just set the
+   * quit flag and return.
+   */
+  state->wk_quitflag = 1;
+}
+
+static
+inline
+void
+worker_thread_handle_msgqueue_event(
+    struct worker_thread* state,
+    struct mqueue_object* mqueue,
+    uint32_t event_flags
+    )
+{
+  if (event_flags & EPOLLERR) {
+    D_FMTSTRING("Error on message queue!");
+    return;
+  }
+
+  for (;;) {
+    struct message msg;
+    ssize_t bytes = HANDLE_EINTR_ON_SYSCALL(
+        mq_receive(state->wk_messagequeue.mq_queuefds,
+                   (char*) &msg,
+                   sizeof(msg),
+                   NULL /* don't care about message priority */));
+    if (bytes == -1) {
+      if (errno == EAGAIN) {
+        return;
+      }
+      D_FUNCFAIL_ERRNO(mq_receive);
+      return;
+    }
+    BUGSTOP_IF((msg.msg_code != kITTMessageAddClient), 
+               "Unknown message code");
+    /*
+     * The client object gets ownership of the socket descriptor.
+     * Should anything go wrong in the creation process it will
+     * close the socket descriptor.
+     */
+    struct client* clnt = client_create(msg.msg_data.msg_fd, 
+                                        state->wk_allocator);
+    if (!clnt) {
+      /*
+       * Client creation failed. Try to get next message, if any.
+       */
+      continue;
+    }
+
+    if (add_fd_to_epoll(state->wk_epoll_fds, clnt->cl_sockfd,
+                        EPOLLIN | EPOLLRDHUP, kDataTypePTR,
+                        clnt) == -1) {
+      client_destroy(clnt, state->wk_allocator);
+      continue;
+    }
+    dlist_push_tail(state->wk_clients, clnt); 
+  }
+}
 
 /*!
  * @brief Simple function to compare clients in a linked list.
@@ -286,30 +414,60 @@ void*
 worker_thread_proc(
     void* args
     ) {
-  struct worker_thread* thread_state = (struct worker_thread*) args;
-  BUGSTOP_IF((!thread_state), "Invalid thread state specified!");
+  struct worker_thread* state = (struct worker_thread*) args;
+  BUGSTOP_IF((!state), "Invalid thread state specified!");
+  D_FMTSTRING("Client thread (%u) starting\n", syscall(SYS_gettid));
   
+  /*
+   * Add the message queue and the termination event to epoll.
+   */
   int result = 0;
-  if (add_fd_to_epoll(thread_state->wk_epoll_fds, 
-                      thread_state->wk_termsig.so_sigfds,
+  if (add_fd_to_epoll(state->wk_epoll_fds, 
+                      state->wk_termsig.so_sigfds,
                       EPOLLIN | EPOLLET,
                       kDataTypePTR,
-                      (void*) &thread_state->wk_termsig)) {
+                      (void*) &state->wk_termsig) == 0) {
     ++result;
-  }
-  if (add_fd_to_epoll(thread_state->wk_epoll_fds,
-                      thread_state->wk_messagequeue.mq_queuefds,
+  } 
+
+  if (add_fd_to_epoll(state->wk_epoll_fds,
+                      state->wk_messagequeue.mq_queuefds,
                       EPOLLIN | EPOLLET,
                       kDataTypePTR,
-                      (void*) &thread_state->wk_messagequeue)) {
+                      (void*) &state->wk_messagequeue) == 0) {
    ++result;
   } 
   
+  /*
+   * Notify waiter with our initialize status.
+   */
   uint64_t init_status = (result == 2 ? kThreadInitOk : kThreadInitFail);
-  HANDLE_EINTR_ON_SYSCALL(write(thread_state->wk_readyevent, &init_status,
+  HANDLE_EINTR_ON_SYSCALL(write(state->wk_readyevent, &init_status,
                                 sizeof(init_status)));
   if (result != 2) {
+    /*
+     * Failed to init so return.
+     */
     return NULL;
+  }
+
+  /*
+   * Loop forever waiting for events.
+   */
+  for (; !state->wk_quitflag;) {
+    struct epoll_event rec_events[kMaxEpollCompletionEntries];
+    int ev_count = HANDLE_EINTR_ON_SYSCALL(epoll_wait(state->wk_epoll_fds,
+                                                      rec_events,
+                                                      kMaxEpollCompletionEntries,
+                                                      -1 /* don;t timeout */));
+    if (ev_count == -1) {
+      D_FUNCFAIL_ERRNO(epoll_wait);
+      break;
+    }
+    for (int i = 0; i < ev_count && !state->wk_quitflag; ++i) {
+      /* do_handle_event(state, rec_events + i); */
+      worker_thread_handle_event(state, rec_events + i);
+    }
   }
 
   return NULL;
@@ -477,6 +635,7 @@ worker_thread_start(
   uint64_t buff_event;
   ssize_t result = HANDLE_EINTR_ON_SYSCALL(read(srvdata->sv_threadrdy_eventfds,
                                            &buff_event, sizeof(buff_event)));
+  D_FMTSTRING("Bytes read from event %d, value %llu", result, buff_event);
   return result == sizeof(buff_event) && buff_event == kThreadInitOk ? 0 : -1;
 }
 
@@ -518,6 +677,33 @@ worker_thread_destroy(
                                          data);
 
     default :
+      break;
+  }
+}
+
+static
+void
+worker_thread_handle_event(
+    struct worker_thread* state,
+    struct epoll_event* ev_data
+    )
+{
+  struct object_identity* object = (struct object_identity*) ev_data->data.ptr;
+
+  switch (object->objid_type) {
+    case kObjectTypeSignal :
+      D_FMTSTRING("Thread %d got term signal", syscall(SYS_gettid));
+      state->wk_quitflag = 1;
+      break;
+
+    case kObjectTypeMessageQueue :
+      break;
+
+    case kObjectTypeClient :
+      break;
+
+    default :
+      D_FMTSTRING("Unknown object type %d", object->objid_type);
       break;
   }
 }

@@ -9,9 +9,9 @@ OBJECTS = $(OUTDIR)/server_main.o									\
 TARGET  = $(OUTDIR)/aio_server
 
 CC      = gcc
-CFLAGS  = -std=c99 -Wall -Werror -Wextra -O0 -ggdb3 -D__OS_LINUX__ \
-          -D__DEBUG_ENABLED__ -D_GNU_SOURCE -rdynamic -I$(HDR_BASE) \
-					-lrt -lpthread
+CFLAGS  = -std=c99 -Wall -Werror -Wextra -O0 -ggdb3 -gdwarf-2									 \
+					-D__OS_LINUX__ -D__DEBUG_ENABLED__ -D_GNU_SOURCE -rdynamic 					 \
+					-I$(HDR_BASE) -lrt -lpthread
 
 $(TARGET) : $(OUTDIR) $(OBJECTS) 
 	  $(CC) $(CFLAGS) $(OBJECTS) -o $@
@@ -64,6 +64,11 @@ $(OUTDIR)/allocator.o :                                 \
   $(SRC_BASE)/debug_helpers.h                           \
   $(SRC_BASE)/debug_helpers_linux.c
 	$(CC) $(CFLAGS) $< -c -o $@
+
+VALGRIND_CHECK : $(TARGET)
+	valgrind -v --track-fds=yes --time-stamp=yes 																 \
+		--log-file=$(OUTDIR)/valgrind_log --num-callers=50 --read-var-info=yes		 \
+		--leak-check=full --leak-resolution=high --track-origins=yes $(TARGET)
 
 .PHONY : clean
 clean :
