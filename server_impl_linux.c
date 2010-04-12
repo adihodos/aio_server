@@ -948,6 +948,7 @@ add_fd_to_epoll(
     break;
   }
 
+  va_end(args_ptr);
   edata.events = event_flags;
   return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &edata);
 }
