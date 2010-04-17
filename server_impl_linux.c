@@ -120,27 +120,87 @@ struct worker_thread {
  * @brief Holds server state data across function calls.
  */
 struct server {
+  /*!
+   * Socket to accept connections.
+   */
   int     sv_acceptfd;
+  /*!
+   * Epoll interface handle.
+   */
   int     sv_epollfd;
+  /*!
+   * Signal descriptor to receive SIGQUIT/SIGINT
+   */
   int     sv_sigfds;
+  /*!
+   * Event descriptor. Used by worker threads to communicate 
+   * result of initialization.
+   */
   int     sv_threadrdy_eventfds;
+  /*!
+   * Pointer to array of pointers to worker threads.
+   */
   struct  worker_thread** sv_workers;
+  /*!
+   * Number of worker threads.
+   */
   long    sv_worker_count;
+  /*!
+   * Index of the next thread to receive a client socket.
+   */
   long    sv_next_wk;
+  /*!
+   * Pointer to the memory allocator.
+   */
   struct  allocator* sv_allocator; 
+  /*!
+   * How much stuff to clean up.
+   */
   int     sv_rollback;
+  /*!
+   * Set to 1 if server has to quit.
+   */
+  int     sv_quitflag;
 };
 
-static const size_t kClientIOBuffSize = 2048;
-
+/*!
+ * @brief Holds client data.
+ */
 struct client {
+  /*!
+   * Identifies this object when receiving a pointer to it via epoll_wait.
+   */
   struct object_identity context;
+  /*!
+   * Socket decriptor.
+   */
   int    cl_sockfd;
+  /*!
+   * File descriptor representing a resource requested by the client.
+   */
   int    cl_filefd;
+  /*!
+   * Buffer for IO.
+   */
   void*  cl_buffer;
+  /*!
+   * How much stuff to clean up for.
+   */
   int    cl_rollback;
 };
 
+/*!
+ * Default size of buffer for IO.
+ */
+static const size_t kClientIOBuffSize = 2048;
+
+/*!
+ * @brief Creates a new client object.
+ * @param sock_fds Socket descriptor to communicate with client.
+ * @return Pointer to client structure on success, NULL on failure.
+ * @remarks Caller must call client_destroy on the returned pointer 
+ * when no longer needed.
+ */
 static
 struct client*
 client_create(
@@ -148,6 +208,7 @@ client_create(
     struct allocator* alc
     )
 {
+  BUGSTOP_IF((sock_fds == -1), "Invalid socket!");
   struct client* cl = alc->al_mem_alloc(alc, sizeof(struct client));
   if (!cl) {
     return NULL;
@@ -169,6 +230,9 @@ ERR_CLEANUP :
   return NULL;
 }
 
+/*!
+ * @brief Frees a previously allocated client structure.
+ */
 static
 void
 client_destroy(
@@ -231,6 +295,10 @@ worker_thread_destroy(
     struct worker_thread* data
     );
 
+/*!
+ * @brief Worker thread event handler function. Dispatches events
+ * to their handlers.
+ */
 static
 void
 worker_thread_handle_event(
@@ -238,6 +306,10 @@ worker_thread_handle_event(
     struct epoll_event* ev_data
     );
 
+/*!
+ * @brief Handles event on signal descriptor in the worker thread.
+ * Sets the quit flags to 1 so that the thread stops.
+ */
 static
 inline
 void
@@ -253,59 +325,15 @@ worker_thread_handle_signal_event(
   state->wk_quitflag = 1;
 }
 
+/*!
+ * @brief Handles event on the thread's message queue.
+ */
 static
-inline
 void
 worker_thread_handle_msgqueue_event(
     struct worker_thread* state,
-    struct mqueue_object* mqueue,
     uint32_t event_flags
-    )
-{
-  if (event_flags & EPOLLERR) {
-    D_FMTSTRING("Error on message queue!");
-    return;
-  }
-
-  for (;;) {
-    struct message msg;
-    ssize_t bytes = HANDLE_EINTR_ON_SYSCALL(
-        mq_receive(state->wk_messagequeue.mq_queuefds,
-                   (char*) &msg,
-                   sizeof(msg),
-                   NULL /* don't care about message priority */));
-    if (bytes == -1) {
-      if (errno == EAGAIN) {
-        return;
-      }
-      D_FUNCFAIL_ERRNO(mq_receive);
-      return;
-    }
-    BUGSTOP_IF((msg.msg_code != kITTMessageAddClient), 
-               "Unknown message code");
-    /*
-     * The client object gets ownership of the socket descriptor.
-     * Should anything go wrong in the creation process it will
-     * close the socket descriptor.
-     */
-    struct client* clnt = client_create(msg.msg_data.msg_fd, 
-                                        state->wk_allocator);
-    if (!clnt) {
-      /*
-       * Client creation failed. Try to get next message, if any.
-       */
-      continue;
-    }
-
-    if (add_fd_to_epoll(state->wk_epoll_fds, clnt->cl_sockfd,
-                        EPOLLIN | EPOLLRDHUP, kDataTypePTR,
-                        clnt) == -1) {
-      client_destroy(clnt, state->wk_allocator);
-      continue;
-    }
-    dlist_push_tail(state->wk_clients, clnt); 
-  }
-}
+    );
 
 /*!
  * @brief Simple function to compare clients in a linked list.
@@ -334,6 +362,10 @@ client_compare(
   }
 }
 
+/*!
+ * @brief Initialized the server's state data.
+ * @return 0 on success, -1 on failure.
+ */
 static 
 int 
 server_init(
@@ -371,7 +403,7 @@ add_fd_to_epoll(
     );
 
 /*!
- * @brief
+ * @brief Starts accepting client connections.
  */
 static 
 void 
@@ -379,19 +411,29 @@ server_start_accepting_clients(
     struct server* srv_ptr
     );
 
+/*!
+ * @brief Dispatches event on the server's epoll interface 
+ * to handler functions.
+ */
 static 
-int 
-server_process_event(
+void 
+server_dispatch_event(
     struct server* srv_ptr, 
     struct epoll_event* event
     );
 
+/*!
+ *@brief Frees all server allocated resources.
+ */
 static 
 void 
 server_cleanup(
     struct server* srv_ptr
     );
 
+/*!
+ * @brief Entry point function.
+ */
 int 
 server_start_and_run(
     int UNUSED_POST(argc), 
@@ -465,7 +507,6 @@ worker_thread_proc(
       break;
     }
     for (int i = 0; i < ev_count && !state->wk_quitflag; ++i) {
-      /* do_handle_event(state, rec_events + i); */
       worker_thread_handle_event(state, rec_events + i);
     }
   }
@@ -561,10 +602,14 @@ worker_thread_create(
    * specified in /proc/sys/fs/mqueue/msgsize_max and
    * /proc/sys/fs/mqueue/msg_max.
    */
-  struct mq_attr queue_attributes; 
-  queue_attributes.mq_flags = O_NONBLOCK; 
+  struct mq_attr queue_attributes = {
+    .mq_flags = O_NONBLOCK,
+    .mq_maxmsg = kMessageQueueMaxMsgCount,
+    .mq_msgsize = kMessageQueueMaxMsgSize
+  };
+  /*queue_attributes.mq_flags = O_NONBLOCK; 
   queue_attributes.mq_maxmsg = kMessageQueueMaxMsgCount;
-  queue_attributes.mq_msgsize = kMessageQueueMaxMsgSize;
+  queue_attributes.mq_msgsize = kMessageQueueMaxMsgSize;*/
 
   wthread->wk_messagequeue.context.objid_type = kObjectTypeMessageQueue;
   wthread->wk_messagequeue.mq_queuefds = mq_open(wthread->wk_mqueue_name,
@@ -632,15 +677,18 @@ worker_thread_start(
    */
   ++thread_data->wk_rollback;
 
+  /*
+   * Wait for the thread to signal its init status.
+   */
   uint64_t buff_event;
   ssize_t result = HANDLE_EINTR_ON_SYSCALL(read(srvdata->sv_threadrdy_eventfds,
                                            &buff_event, sizeof(buff_event)));
   D_FMTSTRING("Bytes read from event %d, value %llu", result, buff_event);
-  return result == sizeof(buff_event) && buff_event == kThreadInitOk ? 0 : -1;
+  return (result == sizeof(buff_event) && buff_event == kThreadInitOk) ? 0 : -1;
 }
 
 /*!
- * @brief Frees all resources previously allocated with a call ro
+ * @brief Frees all resources previously allocated with a call to
  * worker_thread_create.
  */
 static
@@ -697,14 +745,82 @@ worker_thread_handle_event(
       break;
 
     case kObjectTypeMessageQueue :
+      worker_thread_handle_msgqueue_event(state, ev_data->events);
       break;
 
     case kObjectTypeClient :
+      /*
+       * @@ not handled yet
+       */
       break;
 
     default :
       D_FMTSTRING("Unknown object type %d", object->objid_type);
       break;
+  }
+}
+
+static
+void
+worker_thread_handle_msgqueue_event(
+    struct worker_thread* state,
+    uint32_t event_flags
+    )
+{
+  if (event_flags & EPOLLERR) {
+    D_FMTSTRING("Error on message queue!");
+    return;
+  }
+
+  for (;;) {
+    /*
+     * Drain all the bytes from the queue descriptor.
+     */
+    struct message msg;
+    ssize_t bytes = HANDLE_EINTR_ON_SYSCALL(
+        mq_receive(state->wk_messagequeue.mq_queuefds,
+                   (char*) &msg,
+                   sizeof(msg),
+                   NULL /* don't care about message priority */));
+    if (bytes == -1) {
+      if (errno == EAGAIN) {
+        return;
+      }
+      D_FUNCFAIL_ERRNO(mq_receive);
+      return;
+    }
+    BUGSTOP_IF((msg.msg_code != kITTMessageAddClient), 
+               "Unknown message code");
+    /*
+     * The client object gets ownership of the socket descriptor.
+     * Should anything go wrong in the creation process it will
+     * close the socket descriptor.
+     */
+    struct client* clnt = client_create(msg.msg_data.msg_fd, 
+                                        state->wk_allocator);
+    if (!clnt) {
+      /*
+       * Client creation failed. Try to get next message, if any.
+       * Close client socket.
+       */
+      HANDLE_EINTR_ON_SYSCALL(close(msg.msg_data.msg_fd));
+      continue;
+    }
+
+    if (add_fd_to_epoll(state->wk_epoll_fds, clnt->cl_sockfd,
+                        EPOLLIN | EPOLLRDHUP, kDataTypePTR,
+                        clnt) == -1) {
+      /*
+       * Failed to add client socket to epoll so release all resources and get
+       * the next message.
+       */
+      client_destroy(clnt, state->wk_allocator);
+      continue;
+    }
+    /*
+     * Add client to list.
+     */
+    dlist_push_tail(state->wk_clients, clnt); 
   }
 }
 
@@ -718,6 +834,7 @@ server_init(
   memset(p_srv, 0, sizeof(*p_srv));
 
   p_srv->sv_allocator = allocator_handle;
+  p_srv->sv_quitflag = 0;
   p_srv->sv_acceptfd = create_server_socket();
   if (-1 == p_srv->sv_acceptfd) {
     return -1;
@@ -948,7 +1065,6 @@ add_fd_to_epoll(
     break;
   }
 
-  va_end(args_ptr);
   edata.events = event_flags;
   return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &edata);
 }
@@ -959,9 +1075,11 @@ server_start_accepting_clients(
     struct server* srv_ptr
     )
 {
+  /*
+   * Loop waiting for events.
+   */
   struct epoll_event rec_events[kMaxEpollCompletionEntries];
-  int should_quit = 0;
-  for (; !should_quit;) {
+  for (; !srv_ptr->sv_quitflag;) {
     int event_cnt = HANDLE_EINTR_ON_SYSCALL(epoll_wait(srv_ptr->sv_epollfd,
                                                        rec_events,
                                                        kMaxEpollCompletionEntries,
@@ -971,21 +1089,42 @@ server_start_accepting_clients(
       return;
     }
 
-    for (int i = 0; i < event_cnt && !should_quit; ++i) {
-      should_quit = server_process_event(srv_ptr, &rec_events[i]);
+    for (int i = 0; i < event_cnt && !srv_ptr->sv_quitflag; ++i) {
+      server_dispatch_event(srv_ptr, &rec_events[i]);
     }
   }
 }
 
 static 
-int 
-server_process_event(
+void 
+server_dispatch_event(
     struct server* srv_ptr, 
     struct epoll_event* event
     ) 
 {
   if (event->data.fd == srv_ptr->sv_acceptfd) {
-    D_FMTSTRING("accept event!");
+    for (;;) {
+      int client_socket = HANDLE_EINTR_ON_SYSCALL(
+          accept4(srv_ptr->sv_acceptfd, NULL, NULL, 
+                  SOCK_NONBLOCK /* set nonblocking io */));
+      if (client_socket == -1) {
+        /*
+         * Man 2 accept4 says that non blocking can return 
+         * EAGAIN or EWOULDBLOCK.
+         */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          break;
+        }
+        D_FUNCFAIL_ERRNO(accept4);
+        /*
+         * Continue or abort ???
+         */
+        continue;
+      }
+      /*
+       * Send socket to the next worker thread in line.
+       */
+    }
   } else if(event->data.fd == srv_ptr->sv_sigfds) {
     D_FMTSTRING("SIGQUIT/SIGINT - stopping threads and exiting");
     /*
@@ -997,11 +1136,13 @@ server_process_event(
           write(srv_ptr->sv_workers[i]->wk_termsig.so_sigfds, 
                 &buff, sizeof(buff)));
     }
-    return 1;
+    /*
+     * Set quit flag and return.
+     */
+    srv_ptr->sv_quitflag = 1;
   } else {
     D_FMTSTRING("No handler for descriptor %d", event->data.fd);
   }
-  return 0;
 }
 
 static 
